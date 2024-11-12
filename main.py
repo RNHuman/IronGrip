@@ -1,32 +1,16 @@
+import base64
 import tkinter as tk
 from tkinter import ttk, simpledialog, messagebox
 import json
+import time
 import os
 from cryptography.fernet import Fernet
+import bcrypt
 
-# Generate or load encryption key
-KEY_FILE = "secret.key"
 DATA_FILE = "passwords.dat"
+HASH_FILE = "master.hash"
+AUTO_LOCK_TIMEOUT = 300  # Lock after 5 minutes of inactivity (in seconds)
 
-def load_key():
-    if not os.path.exists(KEY_FILE):
-        key = Fernet.generate_key()
-        with open(KEY_FILE, "wb") as key_file:
-            key_file.write(key)
-    else:
-        with open(KEY_FILE, "rb") as key_file:
-            key = key_file.read()
-    return key
-
-def encrypt_data(data, key):
-    fernet = Fernet(key)
-    encrypted = fernet.encrypt(data.encode())
-    return encrypted
-
-def decrypt_data(data, key):
-    fernet = Fernet(key)
-    decrypted = fernet.decrypt(data).decode()
-    return decrypted
 
 class PasswordManager:
     def __init__(self, root):
@@ -34,28 +18,79 @@ class PasswordManager:
         self.root.title("Password Manager")
         self.root.geometry("400x300")
 
-        self.key = load_key()
         self.tabs = {}
+        self.last_active_time = time.time()
 
+        self.master_password = None  # Store master password temporarily for encryption key derivation
+        self.fernet = None  # Store Fernet instance for encryption/decryption
+
+        # Main interface components
         self.notebook = ttk.Notebook(self.root)
         self.notebook.pack(expand=1, fill="both")
 
-        self.menu_bar = tk.Menu(self.root)
-        self.root.config(menu=self.menu_bar)
-
-        # Menu for managing tabs
-        tab_menu = tk.Menu(self.menu_bar, tearoff=0)
-        self.menu_bar.add_cascade(label="Manage Tabs", menu=tab_menu)
-        tab_menu.add_command(label="Add Tab", command=self.add_tab)
-        tab_menu.add_command(label="Rename Tab", command=self.rename_tab)
-        tab_menu.add_command(label="Delete Tab", command=self.delete_tab)
-
-        # Save button
         save_button = tk.Button(self.root, text="Save Data", command=self.save_data)
         save_button.pack(side="bottom", pady=10)
 
-        # Load existing data
-        self.load_data()
+        # Lock mechanism
+        self.root.bind_all("<Any-KeyPress>", self.update_last_active_time)
+        self.root.bind_all("<Any-ButtonPress>", self.update_last_active_time)
+        self.check_auto_lock()
+
+        # Set or verify master password
+        if os.path.exists(HASH_FILE):
+            self.authenticate_user()
+        else:
+            self.set_master_password()
+
+    def update_last_active_time(self, event=None):
+        self.last_active_time = time.time()
+
+    def check_auto_lock(self):
+        if time.time() - self.last_active_time > AUTO_LOCK_TIMEOUT:
+            self.lock_manager()
+        else:
+            self.root.after(1000, self.check_auto_lock)  # Check every second
+
+    def lock_manager(self):
+        self.notebook.pack_forget()
+        messagebox.showinfo("Locked", "Password Manager locked due to inactivity.")
+        self.authenticate_user()
+
+    def set_master_password(self):
+        password = simpledialog.askstring("Set Master Password", "Enter a master password:", show="*")
+        if password:
+            hashed = bcrypt.hashpw(password.encode(), bcrypt.gensalt())
+            with open(HASH_FILE, "wb") as f:
+                f.write(hashed)
+            self.master_password = password
+            self.initialize_fernet()
+            self.load_data()
+
+    def authenticate_user(self):
+        password = simpledialog.askstring("Master Password", "Enter your master password:", show="*")
+        if password:
+            with open(HASH_FILE, "rb") as f:
+                hashed = f.read()
+            if bcrypt.checkpw(password.encode(), hashed):
+                self.master_password = password
+                self.initialize_fernet()
+                self.notebook.pack(expand=1, fill="both")
+                self.load_data()
+                self.last_active_time = time.time()
+            else:
+                messagebox.showerror("Error", "Incorrect master password.")
+                self.authenticate_user()
+
+    def initialize_fernet(self):
+        # Derive key from master password
+        salt = b'salt_'  # In production, use a better salt management strategy
+        key = bcrypt.kdf(
+            password=self.master_password.encode(),
+            salt=salt,
+            desired_key_bytes=32,
+            rounds=100
+        )
+        self.fernet = Fernet(base64.urlsafe_b64encode(key))
 
     def add_tab(self):
         tab_name = simpledialog.askstring("Tab Name", "Enter new tab name:")
@@ -78,8 +113,8 @@ class PasswordManager:
         password_entry = tk.Entry(frame, width=30, show="*")
         password_entry.pack()
 
-        # Button to toggle password visibility
-        toggle_btn = tk.Button(frame, text="Show", command=lambda: self.toggle_password_visibility(password_entry, toggle_btn))
+        toggle_btn = tk.Button(frame, text="Show",
+                               command=lambda: self.toggle_password_visibility(password_entry, toggle_btn))
         toggle_btn.pack(pady=5)
 
         self.tabs[tab_name] = {
@@ -96,27 +131,6 @@ class PasswordManager:
             password_entry.config(show="*")
             toggle_btn.config(text="Show")
 
-    def rename_tab(self):
-        current_tab = self.notebook.select()
-        if current_tab:
-            current_tab_index = self.notebook.index(current_tab)
-            old_name = self.notebook.tab(current_tab_index, 'text')
-
-            new_name = simpledialog.askstring("Rename Tab", f"Enter new name for tab '{old_name}':")
-            if new_name:
-                self.notebook.tab(current_tab_index, text=new_name)
-                self.tabs[new_name] = self.tabs.pop(old_name)
-
-    def delete_tab(self):
-        current_tab = self.notebook.select()
-        if current_tab:
-            current_tab_index = self.notebook.index(current_tab)
-            tab_name = self.notebook.tab(current_tab_index, 'text')
-
-            if messagebox.askyesno("Delete Tab", f"Are you sure you want to delete the tab '{tab_name}'?"):
-                self.notebook.forget(current_tab_index)
-                del self.tabs[tab_name]
-
     def save_data(self):
         tab_data = {}
         for tab_name, fields in self.tabs.items():
@@ -124,11 +138,9 @@ class PasswordManager:
             password = fields['password'].get()
             tab_data[tab_name] = {'email': email, 'password': password}
 
-        # Convert tab data to JSON and encrypt it
         tab_data_json = json.dumps(tab_data)
-        encrypted_data = encrypt_data(tab_data_json, self.key)
+        encrypted_data = self.fernet.encrypt(tab_data_json.encode())
 
-        # Save encrypted data to file
         with open(DATA_FILE, "wb") as file:
             file.write(encrypted_data)
 
@@ -140,8 +152,7 @@ class PasswordManager:
                 encrypted_data = file.read()
 
             try:
-                # Decrypt and load the data
-                decrypted_data = decrypt_data(encrypted_data, self.key)
+                decrypted_data = self.fernet.decrypt(encrypted_data).decode()
                 tab_data = json.loads(decrypted_data)
 
                 for tab_name, data in tab_data.items():
@@ -152,6 +163,7 @@ class PasswordManager:
                     self.tabs[tab_name]['password'].insert(0, data['password'])
             except Exception as e:
                 messagebox.showerror("Error", f"Failed to decrypt data: {e}")
+
 
 if __name__ == "__main__":
     root = tk.Tk()
